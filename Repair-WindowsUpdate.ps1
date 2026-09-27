@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Repairs the Windows Update client; preserves update policies by default.
@@ -43,6 +43,7 @@ $script:ErrorCount = 0
 $script:Warnings = 0
 $script:NeedsReview = $false
 $script:LogFile = $null
+$script:SearchStatus = 'Not run'
 $script:stamp = (Get-Date -Format 'yyyyMMdd_HHmmss_fff') + '_' + [guid]::NewGuid().ToString('N')
 $WuPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $AuPolicyKey = "$WuPolicyKey\AU"
@@ -70,9 +71,17 @@ function Invoke-Step {
     try { & $Action }
     catch { Write-Log "$Name : FAILED - $($_.Exception.Message)" 'ERROR' }
 }
+function Format-NativeOutput {
+    param([string]$File, [string]$Text)
+    # Windows PowerShell can expose embedded NULs in redirected SFC output.
+    # Remove those artifacts only; do not infer success from localized text.
+    if ($File -eq 'sfc.exe') { return ($Text -replace "`0", '') }
+    return $Text
+}
 function Invoke-Native {
     param([string]$File, [string[]]$Arguments)
-    & (Join-Path "$env:SystemRoot\System32" $File) @Arguments 2>&1 | ForEach-Object { Write-Log "$_" }
+    & (Join-Path "$env:SystemRoot\System32" $File) @Arguments 2>&1 |
+        ForEach-Object { Write-Log (Format-NativeOutput -File $File -Text "$_") }
     $code = $LASTEXITCODE
     Write-Log "$File exit code: $code"
     return $code
@@ -255,10 +264,29 @@ function Invoke-DeepRepair {
 }
 
 # ----------------------------------------------- 10. verify + trigger scan --
+function Write-SearchFailureGuidance {
+    param([System.Exception]$Exception)
+    $codes = @()
+    for ($current = $Exception; $null -ne $current; $current = $current.InnerException) {
+        $codes += '0x{0:X8}' -f $current.HResult
+        # COM calls can wrap the useful HRESULT in an inner exception/message.
+        $codes += @([regex]::Matches($current.Message, '(?i)\b0x[0-9a-f]{8}\b') |
+            ForEach-Object { $_.Value.ToUpperInvariant() })
+    }
+    Write-Log "Search exception HRESULT(s): $(($codes | Select-Object -Unique) -join ', ')" 'WARN'
+    if ($codes -contains '0x80072F8F') {
+        Write-Log '0x80072F8F: secure-connection validation failed. Check time synchronization, certificate trust and proxy/TLS inspection; this code alone does not establish a revocation failure.' 'WARN'
+    }
+    if ($codes -contains '0x80092013') {
+        Write-Log '0x80092013: certificate revocation status could not be checked (CRYPT_E_REVOCATION_OFFLINE). Investigate CAPI2 events and revocation retrieval/cache state; this does not by itself prove a firewall block.' 'WARN'
+    }
+    Write-Log 'See README troubleshooting. No certificate imports, trust-cache resets or certificate-validation bypasses are performed.' 'WARN'
+}
 function Invoke-UpdateSearch {
     $session = $null
     $searcher = $null
     $result = $null
+    $script:SearchStatus = 'Failed/incomplete'
     try {
         $session = New-Object -ComObject Microsoft.Update.Session
         $searcher = $session.CreateUpdateSearcher()
@@ -266,9 +294,16 @@ function Invoke-UpdateSearch {
         $searcher.ServerSelection = 0 # ssDefault: honors configured update source.
         $result = $searcher.Search('IsInstalled=0 and IsHidden=0')
         $code = [int]$result.ResultCode
-        if ($code -eq 3) { throw 'Update search partially succeeded; results may be incomplete (ResultCode 3).' }
+        if ($code -eq 3) {
+            $script:SearchStatus = 'Partial (ResultCode 3)'
+            throw 'Update search partially succeeded; results may be incomplete (ResultCode 3).'
+        }
         if ($code -ne 2) { throw "Update search failed/incomplete (ResultCode $code)." }
         Write-Log "Search succeeded: $($result.Updates.Count) applicable update(s). No download/install requested." 'OK'
+        $script:SearchStatus = 'Succeeded (ResultCode 2)'
+    } catch {
+        Write-SearchFailureGuidance $_.Exception
+        throw
     } finally {
         foreach ($com in @($result,$searcher,$session)) {
             if ($null -ne $com -and [Runtime.InteropServices.Marshal]::IsComObject($com)) {
@@ -318,7 +353,14 @@ if ($script:ErrorCount -eq 0) {
             }
         } elseif (-not $WhatIfPreference) { $script:NeedsReview = $true }
     }
-    if ($script:ErrorCount -eq 0 -and $PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'Online Windows Update search using configured source')) {
+}
+$repairStatus = 'Completed'
+if ($WhatIfPreference) { $repairStatus = 'Preview only' }
+elseif ($script:ErrorCount -gt 0) { $repairStatus = 'Failed/incomplete' }
+elseif ($script:NeedsReview) { $repairStatus = 'Completed with review required or an operation declined' }
+if ($script:ErrorCount -eq 0) {
+    if ($PSCmdlet.ShouldProcess($env:COMPUTERNAME, 'Online Windows Update search using configured source')) {
+        $script:SearchStatus = 'Failed/incomplete'
         Invoke-Step 'Step 10: Verify configuration and search' {
             if ($RemoveWsusConfiguration -and @(Get-WsusValue).Count -gt 0) {
                 $script:NeedsReview = $true
@@ -330,6 +372,7 @@ if ($script:ErrorCount -eq 0) {
         }
     } elseif (-not $WhatIfPreference) { $script:NeedsReview = $true }
 }
+Write-Log "Repair steps: $repairStatus; Windows Update search: $script:SearchStatus."
 Write-Log "=== Finished: errors=$script:ErrorCount warnings=$script:Warnings reviewRequired=$script:NeedsReview ==="
 if ($script:ErrorCount -gt 0 -or $script:NeedsReview) { exit 1 }
 exit 0

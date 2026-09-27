@@ -1,4 +1,4 @@
-﻿BeforeAll {
+BeforeAll {
 # Load function definitions via AST; never dot-source the production entry point.
 $sourcePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'Repair-WindowsUpdate.ps1'
 $tokens = $null
@@ -197,10 +197,13 @@ Describe 'Repair safeguards (no live repair operations)' {
             return $session
         } -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' }
         { Invoke-UpdateSearch } | Should -Throw '*partially succeeded*'
+        $script:SearchStatus | Should -Be 'Partial (ResultCode 3)'
         $script:searchResultCode = 4
         { Invoke-UpdateSearch } | Should -Throw '*failed/incomplete*'
+        $script:SearchStatus | Should -Be 'Failed/incomplete'
         $script:searchResultCode = 2
         { Invoke-UpdateSearch } | Should -Not -Throw
+        $script:SearchStatus | Should -Be 'Succeeded (ResultCode 2)'
     }
     It 'reports preflight failure as 2 and performs no repair' {
         Mock Assert-Requirement { throw 'not elevated' }
@@ -255,6 +258,67 @@ Describe 'Repair safeguards (no live repair operations)' {
         Mock Rename-UpdateCache { throw 'file locked' }
         Mock Restore-ServiceSnapshot {}
         { Invoke-CacheRepair } | Should -Throw
+        Assert-MockCalled Restore-ServiceSnapshot -Times 1 -Exactly
+    }
+
+    It 'removes embedded NULs from SFC output without removing spaces or localized text' {
+        $text = 'Windows Resource Protection: verification complete.'
+        $padded = ($text.ToCharArray() | ForEach-Object { "$_`0" }) -join ''
+        Format-NativeOutput 'sfc.exe' $padded | Should -Be $text
+        $localized = 'V' + [char]0x00e9 + 'rification: ' + [char]0x5b8c
+        Format-NativeOutput 'sfc.exe' $localized | Should -Be $localized
+        Format-NativeOutput 'dism.exe' "A`0B" | Should -Be "A`0B"
+    }
+    It 'reports secure failure without claiming confirmed revocation failure' {
+        Mock Write-Log {}
+        $inner = [Runtime.InteropServices.COMException]::new('Secure failure', -2147012721)
+        $outer = [Exception]::new('Wrapped search failure', $inner)
+        Write-SearchFailureGuidance $outer
+        Assert-MockCalled Write-Log -Times 1 -Exactly -ParameterFilter { $Message -like '0x80072F8F:*' }
+        Assert-MockCalled Write-Log -Times 0 -Exactly -ParameterFilter { $Message -like '0x80092013:*' }
+        Assert-MockCalled Invoke-Native -Times 0 -Exactly
+    }
+    It 'provides revocation guidance only with the matching error evidence' {
+        Mock Write-Log {}
+        Write-SearchFailureGuidance ([Runtime.InteropServices.COMException]::new('Revocation offline', -2146885613))
+        Assert-MockCalled Write-Log -Times 1 -Exactly -ParameterFilter { $Message -like '0x80092013:*' }
+        Assert-MockCalled Invoke-Native -Times 0 -Exactly
+        Assert-MockCalled Remove-ItemProperty -Times 0 -Exactly
+    }
+    It 'does not misclassify an unrelated search failure' {
+        Mock Write-Log {}
+        Write-SearchFailureGuidance ([Exception]::new('Unrelated failure'))
+        Assert-MockCalled Write-Log -Times 0 -Exactly -ParameterFilter { $Message -match '^0x800(72F8F|92013):' }
+    }
+    It 'logs guidance and rethrows an actual mocked COM search exception' {
+        Mock Write-Log {}
+        Mock New-Object {
+            $searcher = [pscustomobject]@{ Online=$false; ServerSelection=0 }
+            $searcher | Add-Member ScriptMethod Search {
+                param($Criteria)
+                throw [Runtime.InteropServices.COMException]::new('Secure failure', -2147012721)
+            }
+            $session = [pscustomobject]@{ Searcher=$searcher }
+            $session | Add-Member ScriptMethod CreateUpdateSearcher { $this.Searcher }
+            return $session
+        } -ParameterFilter { $ComObject -eq 'Microsoft.Update.Session' }
+        { Invoke-UpdateSearch } | Should -Throw '*Secure failure*'
+        $script:SearchStatus | Should -Be 'Failed/incomplete'
+        Assert-MockCalled Write-Log -Times 1 -Exactly -ParameterFilter { $Message -like '0x80072F8F:*' }
+        Assert-MockCalled Write-Log -Times 0 -Exactly -ParameterFilter { $Message -like '0x80092013:*' }
+    }
+    It 'keeps repair completion separate from a failed scan and returns 1' {
+        Mock Assert-Requirement {}
+        Mock New-Item {}
+        Mock Add-Content {}
+        Mock Invoke-CacheRepair {}
+        Mock Get-ServiceSnapshot { [pscustomobject]@{ Name='bits'; Status='Running' } }
+        Mock Restore-ServiceSnapshot {}
+        Mock Invoke-UpdateSearch { throw 'Search failed: 0x80072F8F' }
+        Invoke-TestWorkflow -Confirm:$false -SkipDeepRepair | Should -Be 1
+        Assert-MockCalled Write-Information -Times 1 -Exactly -ParameterFilter {
+            $MessageData -like '*Repair steps: Completed; Windows Update search: Failed/incomplete.*'
+        }
         Assert-MockCalled Restore-ServiceSnapshot -Times 1 -Exactly
     }
 

@@ -1,120 +1,171 @@
-﻿# Repair-WindowsUpdate
+# Repair-WindowsUpdate
 
-Repairs a Windows Update client while preserving update policies by default. Intended for Windows Server 2016, 2019, 2022 and 2025; Windows 10/11 may also meet the execution checks. This is intended compatibility, not a tested OS matrix. The original script has been used successfully at work; the hardened version still requires real-server validation.
+Repair the Windows Update client **without removing its update policies**. The script rebuilds update caches, runs DISM/SFC and checks whether an update search works. It never requests update installation or an automatic reboot.
 
-Test on a non-production server first and use a maintenance window. Stop other servicing/deployment jobs before running. Service interruption, cache rebuilding and DISM/SFC can take considerable time. The script never requests update installation or an automatic reboot. Existing scheduled update activity remains governed by your policies and can resume when services recover.
+**Start with a preview, test on a non-production server, and use a maintenance window.** Services are interrupted and cache rebuilding can take time. Pause other servicing/deployment jobs first. Existing scheduled updates can resume when services recover.
 
-## What it does
+## Quick start
 
-1. Checks elevation, 64-bit Windows PowerShell 5.1, Windows build 14393+ and required native tools; creates a unique log.
-2. Records the states of wuauserv, BITS, cryptsvc, UsoSvc and their recursive dependent services. Missing services or transitional/paused states abort the cache operation before shutdown.
-3. Stops those services and verifies they stopped. Failure blocks registry changes, queue deletion and cache renames.
-4. Performs only explicitly requested WSUS removal, identity reset or legacy BITS queue deletion.
-5. Renames SoftwareDistribution and catroot2 to unique timestamped `.bak_*` siblings. Existing backups are never overwritten.
-6. Attempts service recovery in `finally`, including dependents stopped by `Stop-Service -Force`. Each recovery attempt has its own error handling. Originally stopped services are not deliberately started by cache recovery; startup types are unchanged.
-7. Optionally resets Winsock; runs DISM `/Online /Cleanup-Image /RestoreHealth /NoRestart`, then SFC `/scannow` unless `-SkipDeepRepair` is supplied. A failed DISM blocks SFC. DISM uses the configured repair source; WSUS removal does not guarantee access to repair content.
-8. Performs an online Windows Update Agent search using the configured default source. Only ResultCode 2 is successful; 3 is partial/incomplete, and all other results are unsuccessful. It does not download or install the found updates.
-
-A failed repair prerequisite or service recovery blocks later repair/search steps. Operations are not transactional: an earlier rename or value deletion may already have succeeded when a later operation fails. Review the log and backups.
-
-## Usage
-
-Run in **elevated 64-bit Windows PowerShell 5.1**. Follow your organization's signing/execution policy.
+Open **Windows PowerShell 5.1 as Administrator (64-bit)** in the script folder. Follow your organization's signing and execution policy; do not disable it just to run this script.
 
 ```powershell
-# Preview everything requested: no files, logs, backups, scans or changes
+# Preview: no changes, scans, log files or backups
 .\Repair-WindowsUpdate.ps1 -WhatIf
-.\Repair-WindowsUpdate.ps1 -RemoveWsusConfiguration -ResetWsusClientIdentity -ClearBitsQueue -ResetWinsock -WhatIf
 
-# Normal repair; preserves policies, identity and BITS queue files
+# Normal repair: keep WSUS settings, update policies, identity and BITS queues
 .\Repair-WindowsUpdate.ps1
 
-# Skip ONLY DISM/SFC; still repairs caches/services and performs online search
+# Faster repair: skip only DISM and SFC; still rebuild caches and search
 .\Repair-WindowsUpdate.ps1 -SkipDeepRepair
+```
 
-# Explicitly leave WSUS configuration locally, as well as repairing the client
+The script asks for confirmation before each major operation. Review the log in `%ProgramData%\WURepair` afterward. **A normal run that includes SFC returns exit code 1 until you manually review its results**; this does not automatically mean the repair failed.
+
+## What a normal run does
+
+1. Checks elevation, Windows PowerShell version, Windows build and required tools.
+2. Records the current update-service states, including dependent services, then stops and checks them.
+3. Renames `SoftwareDistribution` and `catroot2` to unique `.bak_<timestamp>_<id>` folders. Existing backups stay intact.
+4. Attempts to restore the original service states, even if repair fails.
+5. Runs DISM RestoreHealth with `/NoRestart`, then SFC `/scannow`.
+6. Searches the configured update source and reports the scan result separately from the repair result.
+
+By default, it preserves **all update policies, WSUS client identity and BITS queue files**. It does not change service startup types. A failed prerequisite or service recovery blocks later steps. Earlier changes may remain if a later step fails; this is not an all-or-nothing transaction.
+
+DISM uses the configured repair source. A failed DISM blocks SFC; exit 3010 means a manual reboot is needed and SFC is skipped. Service states are also captured/restored around servicing and the scan. Recovery attempts continue if one service fails to recover.
+
+## Optional operations
+
+Use these only when the operation matches the problem you are fixing. Each command still performs the normal repair workflow.
+
+| Option | What it changes |
+|---|---|
+| `-RemoveWsusConfiguration` | Backs up and removes selected local WSUS routing settings. See below. |
+| `-ResetWsusClientIdentity` | Backs up and removes `SusClientId` and `SusClientIdValidation`. Later registration can create a new WSUS reporting record. |
+| `-ClearBitsQueue` | Permanently deletes legacy `qmgr*.dat` files from `%ProgramData%\Microsoft\Network\Downloader`. Can lose transfers for **all users and applications**. No queue backup; modern BITS database formats are not reset. |
+| `-ResetWinsock` | Runs `netsh winsock reset` and checks its exit code. A successful reset requires a manual reboot and may affect networking software. No built-in rollback. |
+| `-SkipDeepRepair` | Skips **only DISM/SFC**. Cache repair, selected options and the online search still run. |
+| `-LogDir` | Changes the log/registry-backup directory from `%ProgramData%\WURepair`. Use a secured local folder with enough space. |
+| `-WhatIf` | Runs read-only preflight and displays planned operations. No local logs, backups, external commands, service/registry/cache changes or scans. |
+| `-Confirm` | Prompts for the cache/configuration operation, then selected Winsock, DISM/SFC and search steps. Recovery does not prompt again. |
+
+```powershell
+# Preview leaving WSUS
+.\Repair-WindowsUpdate.ps1 -RemoveWsusConfiguration -WhatIf
+
+# Explicitly remove local WSUS routing settings and repair
 .\Repair-WindowsUpdate.ps1 -RemoveWsusConfiguration
 
-# Individually optional, disruptive operations
+# Other options, only when needed
 .\Repair-WindowsUpdate.ps1 -ResetWsusClientIdentity
 .\Repair-WindowsUpdate.ps1 -ClearBitsQueue
 .\Repair-WindowsUpdate.ps1 -ResetWinsock -LogDir 'D:\Logs\WURepair'
 
-# Unattended, after reviewing preview and impacts
+# Suppress prompts only after reviewing the preview and impacts
 .\Repair-WindowsUpdate.ps1 -SkipDeepRepair -Confirm:$false
 ```
 
-## Parameters
+Preflight also applies to preview. Normal runs create logs before confirmation prompts. Declining the cache operation stops dependent work; declining any requested operation returns 1.
 
-| Parameter | Default | Impact |
-|---|---|---|
-| `-RemoveWsusConfiguration` | off | Exports the policy tree, then removes only the routing values listed below |
-| `-ClearBitsQueue` | off | Permanently deletes legacy `qmgr*.dat` from `%ProgramData%\Microsoft\Network\Downloader`; can lose pending BITS transfers for all users/applications, not just Windows Update. No queue backup; modern BITS database formats are not reset |
-| `-ResetWsusClientIdentity` | off | Exports the client key, then removes only `SusClientId` and `SusClientIdValidation`; subsequent WSUS registration can create a new identity/reporting record |
-| `-SkipDeepRepair` | off | Skips only DISM/SFC; all other selected operations and search remain enabled |
-| `-ResetWinsock` | off | Runs `netsh winsock reset`, checks its exit code; successful reset requires a manual reboot and may affect networking software. No automatic rollback |
-| `-LogDir` | `%ProgramData%\WURepair` | Directory for unique run log, service-state XML and required `.reg` exports. Choose a secured local directory with adequate free space; logs/exports contain machine configuration |
-| `-WhatIf` | off | Read-only preflight plus planned-operation messages; no local preview logs/directories, native tools, service changes, registry edits, cache changes or COM searches |
-| `-Confirm` | high-impact prompts | Approves the cache/configuration transaction as a unit, then Winsock, DISM/SFC and search separately. Recovery is part of the approved transaction and is not prompted again. `-Confirm:$false` suppresses prompts |
+## Leaving WSUS is separate from repairing Windows Update
 
-Preflight also applies to preview. A normal run creates local logs before approval prompts. Declining the cache transaction skips dependent work and returns 1; declining later operations also returns 1.
+**You do not need to leave WSUS to repair the client or use Azure Update Manager.** Azure Update Manager supports the machine's configured update source, including WSUS. Coordinate a source change with the team that owns your update policies.
 
-## Optional WSUS removal
+Domain/local GPO, MDM or Configuration Manager can reapply settings. This script does not edit domain GPOs, local policy stores, OU links or inheritance. Preserved policies can still prevent a public-source scan.
 
-Repair does **not** require leaving WSUS. `-RemoveWsusConfiguration` removes these existing values only:
+The scan uses the configured default source. **Windows Update** supplies Windows updates; **Microsoft Update** also supplies supported Microsoft product updates. This script does not register or enable Microsoft Update.
 
-- Under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`: `WUServer`, `WUStatusServer`, `UpdateServiceUrlAlternate`.
-- Under its `AU` subkey: `UseWUServer`.
-- In the WindowsUpdate key, `DoNotConnectToWindowsUpdateInternetLocations` and `SetPolicyDrivenUpdateSourceForDriverUpdates`, `SetPolicyDrivenUpdateSourceForFeatureUpdates`, `SetPolicyDrivenUpdateSourceForQualityUpdates`, `SetPolicyDrivenUpdateSourceForOtherUpdates` **only when their value is 1** (restriction/WSUS selection). Explicit Windows Update selections (0) remain.
+<details>
+<summary>Exactly which settings does -RemoveWsusConfiguration remove?</summary>
 
-It preserves the keys themselves and all other values, including scheduling, reboot, deferral, pause, `UseUpdateClassPolicySource`, `DisableDualScan`, access/UI restrictions and PolicyManager/MDM state. Conflicting preserved policies or management agents can still prevent public-source scanning; resolve them through their policy owner. A WindowsUpdate key's existence alone is never reported as proof of WSUS. The script checks the targeted values after removal, but cannot prove future policy persistence or every effective MDM source.
+After a successful export of `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`:
 
-Domain/local GPO, MDM and Configuration Manager can reapply settings. Have the policy owner change only the relevant update-source policies before migration. The script does not edit domain GPOs, local policy stores, OU links or inheritance.
+- In that key: `WUServer`, `WUStatusServer`, `UpdateServiceUrlAlternate`.
+- In its `AU` subkey: `UseWUServer`.
+- In the parent key, only when set to **1**: `DoNotConnectToWindowsUpdateInternetLocations`, `SetPolicyDrivenUpdateSourceForDriverUpdates`, `SetPolicyDrivenUpdateSourceForFeatureUpdates`, `SetPolicyDrivenUpdateSourceForQualityUpdates`, `SetPolicyDrivenUpdateSourceForOtherUpdates`. Explicit public-source selections (0) remain.
 
-The search honors the configured source. **Windows Update** supplies Windows updates; **Microsoft Update** additionally supplies supported Microsoft product updates. This script does not register or enable Microsoft Update. Azure Update Manager honors the machine's update source and supports WSUS; removing WSUS is not inherently required to use it.
+The keys and unrelated scheduling, reboot, pause and deferral values remain. So do `UseUpdateClassPolicySource`, `DisableDualScan`, access/UI restrictions and PolicyManager/MDM state. The existence of a WindowsUpdate policy key alone is not treated as evidence of WSUS. The script checks for targeted values remaining/reappearing, but cannot prove every effective source or future policy persistence.
+
+</details>
+
+## Read the result
+
+The final summary separates **repair steps** from **Windows Update search**. A completed repair with a failed search means the client still needs investigation. Search ResultCode 2 is success; 3 is partial and incomplete; other codes/exceptions are unsuccessful. Service-recovery errors also count as failures, even if the search succeeded.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Requested automated steps completed, or a valid preview. Not a guarantee that every update problem is fixed. |
+| `1` | An operation failed/was incomplete or declined, a manual reboot is needed, or results need review. |
+| `2` | Preflight or log initialization failed; repair did not start. |
+
+**SFC needs manual review even when its native exit code is 0.** The script does not assume `1 = repaired`. Read its console/log result and the current run's `[SR]` entries in `%windir%\Logs\CBS\CBS.log`. DISM details are in `%windir%\Logs\DISM\dism.log`. Embedded NUL artifacts in captured SFC text are removed for readability; this does not interpret the result or guarantee every localized character was decoded correctly.
+
+Failures before the script starts, such as an execution-policy block, use PowerShell's own exit behavior.
+
+## If the scan still fails
+
+Repeated cache resets are unlikely to fix a certificate or network problem. Keep the run log and investigate the reported error before repeating repair.
+
+| Error/evidence | Next checks |
+|---|---|
+| `0x80072F8F` | Secure-connection validation failed. Check server time/time synchronization, certificate trust and proxy/TLS inspection. This code alone does **not** prove a revocation failure. |
+| `0x80092013` in the exception or supporting diagnostics | Revocation status could not be checked. Inspect CAPI2 events, certificate-chain details and CRL/OCSP retrieval/cache state. It does **not** by itself prove a firewall block. |
+| Partial search or other errors | Review the configured source, effective policies and Windows Update logs. A successful DISM/SFC run does not establish that scanning works. |
+
+Useful first checks (run separately; not added to the repair workflow):
+
+```powershell
+Get-Date
+w32tm.exe /query /status
+netsh.exe winhttp show proxy
+```
+
+For certificate failures, capture `Microsoft-Windows-CAPI2/Operational` events during the failing scan and correlate timestamps with Windows Update logs. If you temporarily enable logging, restore its prior state afterward. A download or browser test under your account may behave differently from the update service.
+
+The script reports guidance from the search exception and inner exceptions; it does not automatically collect CAPI2 logs or infer unseen errors. It **does not import certificates, reset trust caches or bypass certificate/revocation validation**. Review logs for hostnames and other configuration before sharing them publicly.
 
 ## Backups and recovery
 
-- Every registry mutation requires a fresh export of its parent tree. `reg.exe` must return 0 and the export must exist and be nonempty. Failure aborts the affected transaction before deletion; no blanket policy deletion occurs. An export covers values/subkeys, not ACLs or the authoritative GPO/MDM configuration.
-- Logs and `.reg`/service XML filenames include a timestamp and unique run identifier. Cache folders use the same suffix. Keep these until the client is verified working; the script never deletes old cache backups.
-- To restore registry settings, review the export and current policy first. In an elevated maintenance session, use `reg.exe import "D:\Logs\WURepair\<selected-backup>.reg"` and check `$LASTEXITCODE`. Import merges the **entire exported tree**, potentially overwriting newer values; preferably restore only the intended values from a reviewed copy. Coordinate with the management-policy owner.
-- To attempt cache rollback, stop the same services and dependents and verify they stopped. Preserve any newly generated cache directories under different names, rename the selected `.bak_*` directories back, and restore original service states using the XML/log as a reference. Do not overwrite live caches or combine backups from different runs. Partial renames are possible.
-- Cache backups are **not a system rollback**: rebuilding SoftwareDistribution can discard displayed local update history and download state; installed updates are not uninstalled. Later servicing can make old cache data unsuitable. Use your normal system backup/recovery procedure if necessary.
-- BITS queue deletion has no built-in undo; recreate transfers through their owning applications. Restoring an old WSUS identity can reintroduce duplicate-client problems. DISM/SFC and Winsock changes are not reversed by importing a `.reg` file or restoring caches.
-- Recovery is best effort. Service permissions, trigger starts, new dependents, concurrent management activity, process termination or power loss can prevent exact state restoration. Review any recovery errors immediately. No startup types are modified. The update-service states are also captured/restored around DISM/SFC and the search; unrelated servicing services are managed by Windows.
+Keep the run log, `services_*.xml`, registry exports and matching cache folders until the client is verified working. Filenames use a timestamp and unique run ID; old backups are not automatically deleted.
 
-## Results and exit codes
-
-| Code | Meaning |
+| Change | Backup and recovery |
 |---|---|
-| 0 | All requested automated steps completed, or valid `-WhatIf` preview; not proof that every Windows Update problem is fixed |
-| 1 | Failed/incomplete operation, declined operation, manual reboot needed, or result requiring review |
-| 2 | Fatal preflight/log initialization failure; repair did not start |
+| WSUS routing or identity values | A fresh parent-key `.reg` export is required before deletion. `reg.exe` must return 0 and create a nonempty file. Failed backup stops deletion. Review the export and restore only the intended values where possible. |
+| Update caches | Original folders stay beside their replacements as `.bak_*`. Stop and verify the same services/dependents, preserve the new folders under different names, then rename the selected backups back. Restore service states using the XML/log. Never overwrite live caches or mix runs. |
+| Service states | Recorded before cache repair. Recovery is best effort: permissions, trigger starts, concurrent activity or termination can prevent exact restoration. Address recovery errors immediately. Missing, paused or transitional services block initial cache shutdown. |
+| BITS, DISM/SFC or Winsock | No built-in undo. Recreate BITS transfers through their owning applications. Registry/cache backups do not reverse servicing or Winsock changes. |
 
-PowerShell host failures before script execution (for example a parse error, unsupported engine or execution-policy block) have host-defined exit behavior.
-
-Native exit codes are logged. DISM 0 permits SFC; 3010 requests manual reboot and skips SFC; other codes fail. `netsh` must return 0. Microsoft documents SFC console outcomes and CBS `[SR]` entries, **not** a reliable `0 = clean, 1 = repaired` mapping. The script records SFC's actual code, treats nonzero as a problem, and requires review even for 0. Consequently a normal run including SFC returns 1 pending manual review. Review the console/log and this run's timestamps in `%windir%\Logs\CBS\CBS.log`; do not mistake historical entries for this run. See also `%windir%\Logs\DISM\dism.log`.
-
-## Validation and limitations
-
-No repair should be executed on a development workstation. Mocked tests exercise backup failure, preservation of policies, shutdown failure, independent recovery attempts and preview safeguards. Run with Windows PowerShell 5.1 and Pester 5.7.1+ and PSScriptAnalyzer 1.24.0+:
+For a reviewed registry export, use an elevated maintenance session:
 
 ```powershell
-Invoke-Pester .\tests\Repair-WindowsUpdate.Tests.ps1
-Invoke-ScriptAnalyzer .\Repair-WindowsUpdate.ps1
+reg.exe import 'D:\Logs\WURepair\selected-backup.reg'
+$LASTEXITCODE  # Must be 0
 ```
 
-Validation on 2026-09-26: Windows PowerShell 5.1 parsing passed; 21 mocked tests passed with Pester 5.7.1; PSScriptAnalyzer 1.24.0 reported no findings. The one documented analyzer suppression covers internal mutation helpers governed by the script-level confirmation gate. The test runner disables Pester's optional registry sandbox; no repair operations were executed.
+Import merges the **whole exported tree** and can overwrite newer settings; coordinate with the policy owner. Exports do not back up ACLs or authoritative GPO/MDM configuration. Restoring an old WSUS identity can reintroduce duplicate-client problems.
 
-Real non-production Windows Server testing remains required for protected services/dependents, trigger-start races, cache locks/rollback, policy reapplication, WSUS versus public-source searches, BITS formats and localized DISM/SFC output. Network access must suit the configured update and repair sources; no source, proxy, firewall or Microsoft Update enrollment is automatically configured. No version is claimed verified by these mocked tests.
+**Cache backups are not a system backup.** Rebuilding SoftwareDistribution can lose displayed local update history/download state, but does not uninstall installed updates. Later servicing may make old caches unsuitable for recovery. Use your normal system recovery process when needed.
+
+## Compatibility and validation
+
+Intended for Windows Server 2016/2019/2022/2025. Windows 10/11 may meet the checks, but this is not a verified OS matrix. Requires elevated **64-bit Windows PowerShell 5.1**, Windows build 14393+ and the required services/native tools; PowerShell 7 is not supported.
+
+Limited Server 2019 field evidence showed cache repair and DISM/SFC completing while the scan failed certificate revocation validation. This is not proof of a successful end-to-end repair or validation of optional operations. The latest diagnostic/logging changes still need real-server testing, including localized SFC output.
+
+Developer validation uses PowerShell 5.1 parsing, PSScriptAnalyzer and mocked Pester tests; **no repair operations are run on the development machine**. With Pester 5.7.1+ and PSScriptAnalyzer 1.24.0+ installed:
+
+```powershell
+.\tests\Invoke-Validation.ps1
+```
+
+The runner disables Pester's optional registry sandbox. Tests cover failed backups, policy preservation, service shutdown/recovery, preview safeguards, result handling and diagnostic messages. Real-server testing remains necessary for protected services, trigger-start races, cache rollback, policy reapplication, source access and localized output.
 
 ## Microsoft references
 
-- [WSUS and Windows Update source selection](https://learn.microsoft.com/en-us/windows/deployment/update/wufb-wsus) and [Windows Update policy settings](https://learn.microsoft.com/en-us/windows/deployment/update/waas-wu-settings).
-- [Registry export return values](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/reg-export) and [service dependencies](https://learn.microsoft.com/en-us/powershell/scripting/samples/managing-services).
-- [DISM repair sources](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/repair-a-windows-image) and [NoRestart](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-global-options-for-command-line-syntax).
-- [SFC command](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/sfc) and [interpreting CBS logs](https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/analyze-sfc-program-log-file-entries).
-- [Windows Update Agent result codes](https://learn.microsoft.com/en-us/windows/win32/api/wuapi/ne-wuapi-operationresultcode) and [Azure Update Manager sources / Microsoft application updates](https://learn.microsoft.com/en-us/azure/update-manager/support-matrix).
+- [Update source policies](https://learn.microsoft.com/en-us/windows/deployment/update/wufb-wsus) and [Azure Update Manager support](https://learn.microsoft.com/en-us/azure/update-manager/support-matrix).
+- [DISM repair sources](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/repair-a-windows-image), [SFC](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/sfc) and [CBS log interpretation](https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/analyze-sfc-program-log-file-entries).
+- [WUA result codes](https://learn.microsoft.com/en-us/windows/win32/api/wuapi/ne-wuapi-operationresultcode), [WinHTTP errors](https://learn.microsoft.com/en-us/windows/win32/winhttp/error-messages) and [certificate error codes](https://learn.microsoft.com/en-us/windows/win32/com/com-error-codes-4).
+- [Registry export](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/reg-export) and [service dependencies](https://learn.microsoft.com/en-us/powershell/scripting/samples/managing-services).
 
 ## License
 
